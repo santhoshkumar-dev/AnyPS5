@@ -4,8 +4,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <new>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "prx/libSceFont/include/FontInternal.hpp"
@@ -27,6 +31,7 @@ constexpr std::size_t MAX_PARSED_CHARACTERS = 4096;
 constexpr std::int32_t WRITING_MASK_NONE = 0;
 constexpr std::int32_t WRITING_MASK_FORMAT_CHARACTERS = 1;
 constexpr std::uint64_t CHARACTER_FLAG_FORMAT = 1ull << 42;
+constexpr int SYLLABLE_STRING_NON_DETECTION = 0;
 
 struct CharacterStorage {
     std::atomic<std::uint32_t> refCount{1};
@@ -117,6 +122,21 @@ bool IsFormatCode(std::uint32_t code) {
     default:
         return false;
     }
+}
+
+bool IsSyllableFreeCode(std::uint32_t code) {
+    struct Range {
+        std::uint32_t first;
+        std::uint32_t last;
+    };
+    static constexpr Range ranges[] = {
+        {0x0000, 0x00AC}, {0x00AE, 0x02FF}, {0x0370, 0x03FF}, {0x0400, 0x0482}, {0x048A, 0x052F},
+        {0x1E00, 0x1FFF}, {0x2000, 0x200A}, {0x2010, 0x2027}, {0x202F, 0x205F}, {0x2070, 0x20CF},
+        {0x2100, 0x2BFF}, {0x3000, 0x3029}, {0x3030, 0x303F}, {0x3041, 0x3096}, {0x309B, 0x30FF},
+        {0x31F0, 0x31FF}, {0x3400, 0x4DBF}, {0x4E00, 0x9FFF}, {0xF900, 0xFAFF}, {0xFF01, 0xFF9D},
+        {0xFFE0, 0xFFEE}, {0x20000, 0x3FFFF},
+    };
+    return std::any_of(std::begin(ranges), std::end(ranges), [code](const Range& range) { return code >= range.first && code <= range.last; });
 }
 
 FontTextCharacter MakeCharacter(FontHandle font, std::uint32_t code, void* textOrder) {
@@ -488,6 +508,19 @@ const FontTextCharacter* APS5_VABI sceFontStringRefersRenderCharacters(FontStrin
 int APS5_VABI sceFontCharacterGetBidiLevel(const FontTextCharacter* textCharacter, int* bidiLevel) {
     if (!textCharacter || !bidiLevel) return SCE_FONT_ERROR_INVALID_PARAMETER;
     *bidiLevel = static_cast<int>(LevelOf(textCharacter));
+    return SCE_FONT_OK;
+}
+
+int APS5_VABI sceFontCharacterGetSyllableStringState(const FontTextCharacter* textCharacter, int* syllableStringState) {
+    if (!textCharacter || !syllableStringState) return SCE_FONT_ERROR_INVALID_PARAMETER;
+    const FontTextCharacter* const neighbourhood[] = {textCharacter->prev, textCharacter, textCharacter->next};
+    for (const FontTextCharacter* character : neighbourhood) {
+        if (!character || IsSyllableFreeCode(character->characterCode)) continue;
+        char code[16];
+        std::snprintf(code, sizeof code, "U+%04X", character->characterCode);
+        throw std::runtime_error(std::string(__func__) + ": syllable state next to " + code + " is not modelled");
+    }
+    *syllableStringState = SYLLABLE_STRING_NON_DETECTION;
     return SCE_FONT_OK;
 }
 
