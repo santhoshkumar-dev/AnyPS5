@@ -327,7 +327,15 @@ std::uint32_t decodeSamples(const Registers& cx) {
             const auto bits = (word >> (8u * (sample % 4u))) & 0xffu;
             const auto x = static_cast<std::int8_t>(static_cast<std::uint8_t>(bits << 4u)) >> 4;
             const auto y = static_cast<std::int8_t>(static_cast<std::uint8_t>(bits & 0xf0u)) >> 4;
-            Require(x == standard[sample][0] && y == standard[sample][1], "nonstandard sample locations are unsupported");
+            if (x != standard[sample][0] || y != standard[sample][1]) {
+                std::string words;
+                for (std::uint32_t i = 0; i < 16; ++i) {
+                    char hex[12];
+                    std::snprintf(hex, sizeof hex, " %08x", read(cx, 0x2fe + i));
+                    words += hex;
+                }
+                Require(false, "nonstandard sample locations are unsupported (PA_SC_AA_CONFIG " + std::to_string(config) + ", PA_SC_AA_SAMPLE_LOCS" + words + ")");
+            }
         }
     }
     return samples;
