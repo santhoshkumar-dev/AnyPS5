@@ -1699,7 +1699,9 @@ void multisampleTests() {
     queue.context[0x3b1] = queue.context[0x3b0];
     queue.context[0x3b9] = queue.context[0x3b8];
     queue.context[0x32b] = queue.context[0x31c] | 0x2000u;
-    queue.context[0x32e] = 0x1234;
+    queue.context[0x32e] = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(cmaskMemory.data()) >> 8u);
+    queue.context[0x399] = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(cmaskMemory.data()) >> 40u);
+    queue.context[0x3b9] = 0x0dc00000u;
     expectFailure([&] { DecodeColorMetadataPass(queue); }, "fast-clear color target");
     queue = multisampled();
     queue.context[0x2f8] = 0;
