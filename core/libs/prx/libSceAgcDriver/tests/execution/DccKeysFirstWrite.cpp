@@ -29,6 +29,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -281,7 +282,7 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     fillKeys(0x00, DccKeys::Clear0000);
     Dispatch(device, WriteCode, writeData, false);
     Dispatch(device, ClearKeysCode, clearTailData, false);
-    readPending(DccKeys::Uncompressed, false, "a kernel's 0000 store over half the keys after the first write's uncompressed store");
+    readPending(DccKeys::Uncompressed, true, "a kernel's 0000 store over half the keys after the first write's uncompressed store");
     Require(AgcDriver::Graphics::CurrentDccKeys(AddressOf(keys), SurfaceBytes) == DccKeys::Mixed, "the keys after a kernel's 0000 store over half of them are not mixed");
     StorageTexture::FlushPending(surface, SurfaceBytes, nullptr, "test");
     device.WaitIdle();
@@ -319,12 +320,12 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     }
     readPending(DccKeys::Uncompressed, false, "a pending fill of the keys with 0x10, which is no clear code");
     Require(fill(0, KeyBytes / 2, 0x00) && fill(KeyBytes / 2, KeyBytes / 2, 0x00), "the 0000 fills of the key halves were not recorded");
-    readPending(DccKeys::Clear0000, true, "pending 0000 fills over both halves of the keys");
+    readPending(DccKeys::Clear0000, false, "pending 0000 fills over both halves of the keys");
     Require(fill(0, KeyBytes / 2, 0x40), "the 0001 fill of the first key half was not recorded");
     Dispatch(device, ClearKeysCode, clearTailData, false);
     readPending(DccKeys::Uncompressed, true, "a pending 0001 fill over half the keys and a kernel's 0000 store over the other half");
     Require(fill(0, KeyBytes, 0x10) && fill(0, KeyBytes, 0x00), "the 0x10 and 0000 fills of the keys were not recorded");
-    readPending(DccKeys::Clear0000, true, "a pending 0x10 fill of the keys overwritten by a pending 0000 fill");
+    readPending(DccKeys::Clear0000, false, "a pending 0x10 fill of the keys overwritten by a pending 0000 fill");
     Require(fill(KeyBytes / 2, KeyBytes / 2, 0x10), "the 0x10 fill of the second key half was not recorded");
     device.WaitIdle();
     Require(fill(0, KeyBytes / 2, 0x00), "the 0000 fill of the first key half was not recorded");
@@ -367,6 +368,143 @@ void RunReusedKeys(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     device.WaitIdle();
     RequireKeys(keys, 0x5a, "the key bytes the title reused after the first write, after the image's write-back");
     Require(Count(texels, SurfaceBytes, 0xff) == Threads * 4u, "reused keys: the write-back lost the image's results");
+}
+
+bool RunPendingFills(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
+    using namespace AgcDriver::Graphics;
+    std::cout << "Pending DCC fills on " << device.DeviceName() << '\n';
+    const auto surface = AddressOf(block);
+    auto* keys = block + KeysOffset;
+    const auto meta = AddressOf(keys);
+    std::memset(block, 0x55, SurfaceBytes);
+    std::memset(keys, 0x00, KeyBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto texture = TextureDescriptor(block, keys);
+    std::vector<std::uint32_t> writeData(16, 0u);
+    std::copy(texture.begin(), texture.end(), writeData.begin() + 4);
+    std::vector<std::uint32_t> clearData(16, 0u);
+    const auto buffer = BufferDescriptor(keys, KeyBytes);
+    std::copy(buffer.begin(), buffer.end(), clearData.begin());
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Dispatch(device, WriteCode, writeData);
+    const auto image = StorageTexture::FindPending(surface, SurfaceBytes);
+    Require(image != nullptr, "pending fills: no storage image");
+    StorageTexture::FlushPending(surface, SurfaceBytes, nullptr, "pending fills setup");
+    device.WaitIdle();
+    auto* recorder = Recorder::Active();
+    Require(recorder != nullptr, "pending fills: no recorder");
+    const std::array<std::uint32_t, 4> initial{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+    if (!device.FillBuffer(meta, KeyBytes, initial)) {
+        std::puts("skipped, pending DCC fill execution requires a metadata host import");
+        return false;
+    }
+    const auto fill = [&](std::size_t offset, std::size_t bytes, std::uint8_t key) {
+        const auto word = key * 0x01010101u;
+        const std::array<std::uint32_t, 4> pattern{word, word, word, word};
+        Require(device.FillBuffer(meta + offset, bytes, pattern), "pending fills: metadata has no host import");
+    };
+    const auto proof = [&](std::optional<std::uint8_t> expected, const char* what) {
+        Require(recorder->OpenFillValue(meta, KeyBytes) == expected, what);
+    };
+    fill(CopiedKeysOffset - KeysOffset, KeyBytes, 0x7b);
+    fill(0, KeyBytes / 2, 0x00);
+    fill(KeyBytes / 2, KeyBytes / 2, 0x00);
+    const auto submitted = recorder->Submissions();
+    const auto scans = KeyProofCounts();
+    image->Refresh();
+    const auto refreshed = KeyProofCounts();
+    std::printf("split clear refresh: submissions=%llu, scans=%llu, unstable=%llu\n", static_cast<unsigned long long>(recorder->Submissions() - submitted), static_cast<unsigned long long>(refreshed.scanned - scans.scanned), static_cast<unsigned long long>(refreshed.unstable - scans.unstable));
+    Require(recorder->Submissions() == submitted && recorder->OpenWriteOverlaps(meta, KeyBytes) && recorder->OpenWriteOverlaps(surface + CopiedKeysOffset, KeyBytes), "split clear: refresh submitted or waited for the key writers or unrelated work");
+    proof(0x00, "split clear: no exact full-range proof");
+    Require(image->UploadedKeys() == DccKeys::Clear0000 && image->KeyProof().generation == 0, "split clear: refresh used stale keys or retained a transient proof");
+    Dispatch(device, WriteRowCode, writeData, false);
+    Require(recorder->Submissions() == submitted, "split clear: continued GPU work submitted to discover keys");
+    StorageTexture::FlushPending(surface, SurfaceBytes, nullptr, "pending fills write-back");
+    device.WaitIdle();
+    RequireKeys(keys, 0xff, "split clear followed by a storage write");
+    Require(Count(block, SurfaceBytes, 0xff) == Threads * 4u && Count(block, SurfaceBytes, 0x00) == SurfaceBytes - Threads * 4u, "split clear: final texels do not contain the clear and later write");
+    std::puts("pending fills: continued write-back correct");
+
+    fill(0, KeyBytes, 0x00);
+    Dispatch(device, ClearKeysCode, clearData, false);
+    fill(0, KeyBytes, 0xff);
+    proof(0xff, "clear -> unknown -> known store did not use the newest full-range writer");
+    const auto knownSubmitted = recorder->Submissions();
+    Require(image->ProvedKeys() == DccKeys::Uncompressed && recorder->Submissions() == knownSubmitted, "known uncompressed store lost its fast path");
+    device.WaitIdle();
+
+    fill(0, KeyBytes, 0xff);
+    Dispatch(device, ClearKeysCode, clearData, false);
+    proof(std::nullopt, "known store -> unknown write manufactured a known state");
+    const auto unknownSubmitted = recorder->Submissions();
+    Require(image->ProvedKeys() == DccKeys::Clear0000, "unknown writer did not resolve to its actual keys");
+    Require(recorder->Submissions() == unknownSubmitted + 1 && !recorder->PendingWriteOverlaps(meta, KeyBytes), "unresolved writer did not synchronize before CPU key discovery");
+
+    Dispatch(device, ClearKeysCode, clearData, false);
+    fill(0, KeyBytes / 2 + 16, 0x40);
+    proof(std::nullopt, "a partial fill hid an uncovered unknown writer");
+    fill(KeyBytes / 2, KeyBytes / 2, 0x40);
+    proof(0x40, "unknown -> overlapping clears did not prove their complete coverage");
+    const auto clearSubmitted = recorder->Submissions();
+    image->Refresh();
+    Require(image->UploadedKeys() == DccKeys::Clear0001 && recorder->Submissions() == clearSubmitted, "a later clear did not replace the unknown writer without waiting");
+    Dispatch(device, WriteRowCode, writeData, false);
+    Require(recorder->Submissions() == clearSubmitted, "unknown -> clear -> storage write submitted for key discovery");
+    StorageTexture::FlushPending(surface, SurfaceBytes, nullptr, "unknown overwritten by clear");
+    device.WaitIdle();
+    RequireKeys(keys, 0xff, "unknown -> clear -> storage write");
+    Require(Count(block, SurfaceBytes, 0xff) == SurfaceBytes / 4 + Threads * 3u && Count(block, SurfaceBytes, 0x00) == SurfaceBytes / 4 * 3 - Threads * 3u, "unknown -> clear -> storage write lost the clear or later texels");
+    fill(0, KeyBytes, 0x40);
+    image->Refresh();
+    device.WaitIdle();
+    fill(0, KeyBytes / 2, 0x40);
+    fill(KeyBytes / 2, KeyBytes / 2, 0xc0);
+    proof(std::nullopt, "different clear codes manufactured a uniform full-range proof");
+    device.WaitIdle();
+    Dispatch(device, ClearKeysCode, clearData, false);
+    proof(std::nullopt, "an unknown writer after a clear acquired a fill proof");
+    const auto afterClearSubmitted = recorder->Submissions();
+    Require(image->ProvedKeys() == DccKeys::Clear0000 && recorder->Submissions() == afterClearSubmitted + 1, "an unknown writer after a clear was read before its keys settled");
+
+    fill(0, KeyBytes, 0x80);
+    const auto cpuSubmitted = recorder->Submissions();
+    std::array<std::byte, KeyBytes> read{};
+    AgcDriver::GuestMemory::Read(meta, read);
+    Require(recorder->Submissions() == cpuSubmitted + 1 && std::all_of(read.begin(), read.end(), [](auto byte) { return byte == std::byte{0x80}; }), "a genuine CPU read did not synchronize and read the final metadata");
+    proof(std::nullopt, "a reaped fill retained a recorder proof");
+    fill(0, KeyBytes, 0xc0);
+    std::array<std::byte, KeyBytes> edited{};
+    std::fill(edited.begin(), edited.end(), std::byte{0x40});
+    AgcDriver::GuestMemory::Write(meta, edited);
+    proof(std::nullopt, "a CPU metadata modification retained a GPU proof");
+    RequireKeys(keys, 0x40, "a CPU metadata write after a pending fill");
+    fill(0, KeyBytes, 0x80);
+    proof(0x80, "a GPU fill after a CPU write did not establish its new state");
+    device.WaitIdle();
+
+    auto converted = image->Descriptor();
+    converted.format = 30;
+    for (const auto key : {std::uint8_t{0x40}, std::uint8_t{0x80}}) {
+        fill(0, KeyBytes, key);
+        bool refused = false;
+        try {
+            static_cast<void>(WaitForKeyWriters(converted, SurfaceBytes));
+        } catch (const std::runtime_error& error) {
+            refused = std::string(error.what()).find("converted texture format") != std::string::npos;
+        }
+        Require(refused, "a pending fill bypassed converted-format clear validation");
+        device.WaitIdle();
+    }
+
+    recorder->NotePendingFill(meta, KeyBytes, 0xff);
+    proof(0xff, "mapping invalidation setup has no proof");
+    GuestAllocations::Mutation().Remove(block);
+    GuestAllocations::Mutation().Add(block, BlockBytes, true, true, true);
+    proof(std::nullopt, "guest memory reused at the same address inherited a pending proof");
+    device.WaitIdle();
+    proof(std::nullopt, "a completed batch retained a pending proof");
+    std::puts("pending fill ordering, CPU consumers and mapping invalidation passed");
+    return true;
 }
 
 void RunUntrackedReuse(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
@@ -494,7 +632,7 @@ void RunSharedImport(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         std::optional<GuestBlock> block;
         std::optional<GuestBlock> watched;
@@ -503,6 +641,15 @@ int main() {
         std::optional<GuestBlock> window;
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (argc == 2 && std::string(argv[1]) == "--pending-fills-only") {
+#ifdef _WIN32
+            shared.emplace(true, true);
+            return RunPendingFills(*device, shared->Data()) ? 0 : VulkanTestSkipped;
+#else
+            block.emplace(false);
+            return RunPendingFills(*device, block->Data()) ? 0 : VulkanTestSkipped;
+#endif
+        }
         block.emplace(false);
         Run(*device, block->Data());
         untracked.emplace(false);

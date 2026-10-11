@@ -2573,6 +2573,10 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     if (bytes == 0) return false;
     ensureOpen();
     const auto end = address + bytes;
+    if (open->writes.empty()) {
+        open->writeMappingSerial = GuestMemory::ForgetSerial();
+        open->writeRegistryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    }
     open->writes.emplace_back(address, end);
     open->writeNotes.push_back(++writeNoteCount);
     open->writeValues.push_back(static_cast<std::int16_t>(value));
@@ -2728,6 +2732,52 @@ std::vector<Recorder::PendingWrite> Recorder::PendingWritesOver(std::uint64_t ad
     if (open != nullptr) scan(*open);
     for (const auto& batch : inFlight) scan(*batch);
     return found;
+}
+
+std::optional<std::uint8_t> Recorder::OpenFillValue(std::uint64_t address, std::size_t bytes) const {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || open == nullptr || open->writes.empty() || !GuestMemory::GpuMutex().HeldByThisThread()) return std::nullopt;
+    const auto mapping = GuestMemory::ForgetSerial();
+    const auto currentMapping = [&] {
+        return (mapping & 1u) == 0 && open->writeMappingSerial == mapping && GuestMemory::ForgetSerial() == mapping
+            && open->writeRegistryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    };
+    if (!currentMapping()) return std::nullopt;
+    const auto [lastBegin, lastEnd] = open->writes.back();
+    if (lastBegin <= address && address + bytes <= lastEnd) {
+        const auto value = open->writeValues.back();
+        if (value < 0) return std::nullopt;
+        if (currentMapping()) return static_cast<std::uint8_t>(value);
+        return std::nullopt;
+    }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> uncovered{{address, address + bytes}};
+    std::optional<std::uint8_t> value;
+    for (std::size_t i = open->writes.size(); i-- > 0;) {
+        const auto [begin, end] = open->writes[i];
+        for (std::size_t j = 0; j < uncovered.size();) {
+            const auto [from, to] = uncovered[j];
+            if (end <= from || to <= begin) {
+                ++j;
+                continue;
+            }
+            const auto written = open->writeValues[i];
+            if (written < 0 || (value.has_value() && *value != written)) return std::nullopt;
+            value = static_cast<std::uint8_t>(written);
+            if (from < begin && end < to) {
+                uncovered[j] = {from, begin};
+                uncovered.emplace_back(end, to);
+                ++j;
+            } else if (from < begin) {
+                uncovered[j++] = {from, begin};
+            } else if (end < to) {
+                uncovered[j++] = {end, to};
+            } else {
+                uncovered[j] = uncovered.back();
+                uncovered.pop_back();
+            }
+        }
+        if (uncovered.empty()) return currentMapping() ? value : std::nullopt;
+    }
+    return std::nullopt;
 }
 
 bool Recorder::ReadTracking() {

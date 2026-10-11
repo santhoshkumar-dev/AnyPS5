@@ -57,6 +57,10 @@ DccKeys ByteKeys(std::uint8_t key) {
     }
 }
 
+void RequireClearFormat(const GuestTextureResource& resource, DccKeys keys) {
+    if (IsConvertedTextureFormat(resource.format) && (keys == DccKeys::Clear0001 || keys == DccKeys::Clear1110)) throw std::runtime_error(std::string("AGC graphics: DCC clear code ") + DccKeysName(keys) + " of converted texture format " + std::to_string(resource.format) + " is not implemented");
+}
+
 // APS5_PROFILE_DRAW: key scans, their bytes and time, printed as [dcc] every 10 s, with the hits of
 // the GPU-store memo below and the "uncompressed" key stores by where they were made. Flush syncs
 // stay 0 (no key read syncs the recorder); the field is kept so the line's shape does not change.
@@ -418,6 +422,14 @@ namespace {
 DccKeys readDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized) {
     memoized = false;
     if (metaAddress == 0 || count == 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(metaAddress), count)) return DccKeys::Unreadable;
+    if (GuestMemory::GpuMutex().HeldByThisThread() && !AnyShadowedOverlaps(metaAddress, count)) {
+        if (const auto* recorder = Recorder::Active()) {
+            if (const auto value = recorder->OpenFillValue(metaAddress, count)) {
+                memoized = true;
+                return ByteKeys(*value);
+            }
+        }
+    }
     // A driver store still pending on the GPU is not in the bytes yet.
     if (const auto memo = MemoizedKeys(metaAddress, metaAddress + count)) {
         memoized = true;
@@ -450,7 +462,7 @@ DccKeys textureClearKeys(const GuestTextureResource& resource, std::uint64_t gue
     if (resource.dccAddress == 0) return DccKeys::Uncompressed;
     const auto keys = readDccKeys(resource.dccAddress, DccKeyBytes(guestBytes), memoized);
     if (keys == DccKeys::Uncompressed) return keys;
-    if (IsConvertedTextureFormat(resource.format) && (keys == DccKeys::Clear0001 || keys == DccKeys::Clear1110)) throw std::runtime_error(std::string("AGC graphics: DCC clear code ") + DccKeysName(keys) + " of converted texture format " + std::to_string(resource.format) + " is not implemented");
+    RequireClearFormat(resource, keys);
     std::byte probe[16]{};
     if (!IsDccClear(keys) || !FillDccClear(ResolveTextureFormat(resource.format), keys, resource.dccAlphaOnMsb, std::span(probe, std::min<std::size_t>(sizeof(probe), BytesPerElement(resource.format))))) {
         static std::mutex reportedMutex;
@@ -663,6 +675,7 @@ void ReadTextureSurface(const GuestTextureResource& resource, DccKeys keys, std:
 namespace {
 
 DccKeys EncodedKeys(const GuestTextureResource& resource, DccKeys keys) {
+    RequireClearFormat(resource, keys);
     std::byte probe[16]{};
     if (!IsDccClear(keys) || !FillDccClear(ResolveTextureFormat(resource.format), keys, resource.dccAlphaOnMsb, std::span(probe, std::min<std::size_t>(sizeof(probe), BytesPerElement(resource.format))))) return DccKeys::Uncompressed;
     return keys;
@@ -694,7 +707,8 @@ bool PendingFillsLeaveUncompressed(const Recorder& recorder, const GuestTextureR
             if (write.end < to) rest.emplace_back(write.end, to);
         }
         unwritten = std::move(rest);
-        if (covered && write.value >= 0) see(write.value);
+        if (covered && write.value < 0) return false;
+        if (covered) see(write.value);
     }
     for (const auto& [from, to] : unwritten) {
         if (mixed) break;
@@ -713,6 +727,9 @@ std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, s
     if (metaAddress == 0 || count == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return std::nullopt;
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || !recorder->PendingWriteOverlaps(metaAddress, count) || PendingStoreKeys(*recorder, metaAddress, count).has_value()) return std::nullopt;
+    if (!AnyShadowedOverlaps(metaAddress, count)) {
+        if (const auto value = recorder->OpenFillValue(metaAddress, count)) return EncodedKeys(resource, ByteKeys(*value));
+    }
     if (PendingFillsLeaveUncompressed(*recorder, resource, count)) return DccKeys::Uncompressed;
     Recorder::CountSync(2);
     recorder->SyncThrough(metaAddress, count);

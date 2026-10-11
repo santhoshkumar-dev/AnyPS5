@@ -46,6 +46,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -331,6 +332,56 @@ void readTrackingTests(const Device& device, Recorder& recorder) {
     Require(Recorder::ReadCounts().hits[static_cast<std::size_t>(Kind::AddressBased)] >= 2, "address-based hits are not counted");
     recorder.Sync();
     Require(recorder.Idle() && !recorder.PendingReadOverlaps(0x20000, 0x1000, false), "noted ranges outlived their batch");
+}
+
+void openFillProofTests(const Device& device, Recorder& recorder) {
+    constexpr std::uint64_t address = 0x100000;
+    constexpr std::size_t bytes = 256;
+    const auto proof = [&](std::optional<std::uint8_t> expected, const char* what) {
+        Require(recorder.OpenFillValue(address, bytes) == expected, what);
+    };
+    proof(std::nullopt, "an empty recorder has a pending fill proof");
+    recorder.NotePendingFill(address, bytes / 2, 0x40);
+    proof(std::nullopt, "a half-range fill proves the whole range");
+    recorder.NotePendingWrite(address + bytes, bytes);
+    recorder.NotePendingFill(address + bytes / 2, bytes / 2, 0x40);
+    proof(0x40, "two fills separated by a disjoint writer did not prove their range");
+    recorder.NotePendingWrite(address + 32, 64);
+    proof(std::nullopt, "a later partial unknown writer retained a fill proof");
+    recorder.NotePendingFill(address + 32, 64, 0x40);
+    proof(0x40, "a fill replacing the unknown part did not restore a proof");
+    recorder.NotePendingFill(address + 64, 128, 0xc0);
+    proof(std::nullopt, "overlapping different fills manufactured a uniform proof");
+    recorder.NotePendingFill(address, bytes, 0x80);
+    proof(0x80, "a full fill did not replace all earlier writers");
+    Require(!recorder.OpenFillValue(address, 0).has_value(), "an empty range acquired a fill proof");
+    Require(!recorder.OpenFillValue(std::numeric_limits<std::uint64_t>::max() - 3, bytes).has_value(), "an overflowing range acquired a fill proof");
+    recorder.Submit();
+    proof(std::nullopt, "a submitted batch retained an open-fill proof");
+    device.WaitQueue();
+    proof(std::nullopt, "a signaled, unreaped batch retained an open-fill proof");
+    recorder.NotePendingFill(address, bytes / 2, 0x80);
+    proof(std::nullopt, "a submitted fill contributed stale bytes to a partial open proof");
+    recorder.NotePendingFill(address + bytes / 2, bytes / 2, 0x80);
+    proof(0x80, "new open fills could not replace a submitted writer");
+    recorder.Sync();
+    proof(std::nullopt, "a reaped batch retained an open-fill proof");
+    recorder.NotePendingFill(address, bytes, 0xff);
+    proof(0xff, "recorder replacement setup has no proof");
+    {
+        Recorder replacement(device.GetContext());
+        replacement.Activate();
+        Require(!replacement.OpenFillValue(address, bytes).has_value(), "a replacement recorder inherited the previous recorder's proof");
+    }
+    {
+        Device replacementDevice;
+        Recorder replacement(replacementDevice.GetContext());
+        replacement.Activate();
+        Require(!replacement.OpenFillValue(address, bytes).has_value(), "a replacement device inherited the previous recorder's proof");
+    }
+    recorder.Activate();
+    recorder.Sync();
+    std::cout << "Recorder pending fill coverage and lifetime tests passed\n";
 }
 
 void writeSettledTests(const Device& device, Recorder& recorder) {
@@ -4946,6 +4997,10 @@ int main(int argc, char** argv) {
             settledBaselineTests(device, recorder);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--pending-fill-proofs-only") {
+            openFillProofTests(device, recorder);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--completion-labels-only") {
             completionCountTests(device, recorder);
             afterRecordedWorkTests(device, recorder);
@@ -4981,6 +5036,7 @@ int main(int argc, char** argv) {
         }
 
         readTrackingTests(device, recorder);
+        openFillProofTests(device, recorder);
         writeSettledTests(device, recorder);
         completionCountTests(device, recorder);
         afterRecordedWorkTests(device, recorder);
