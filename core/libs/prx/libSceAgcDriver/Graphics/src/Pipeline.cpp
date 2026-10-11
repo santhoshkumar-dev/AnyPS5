@@ -188,6 +188,8 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
     if (state.stages.tessellation) appendKey(keys.preRasterization, state.stages.tessellation->inputControlPoints);
     for (const auto& blend : state.blends) appendKey(keys.fragmentOutput, blend);
     for (const auto value : state.blendConstants) appendKey(keys.fragmentOutput, value);
+    appendKey(keys.fragmentShader, state.samples);
+    appendKey(keys.fragmentOutput, state.samples);
     appendKey(keys.renderPass, state.blends.size());
     for (const auto& color : state.colors) {
         appendKey(keys.renderPass, color.format);
