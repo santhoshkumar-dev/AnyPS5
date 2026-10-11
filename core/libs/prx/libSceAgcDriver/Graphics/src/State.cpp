@@ -884,7 +884,7 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     const auto format = (info >> 2u) & 0x1fu;
     const auto decoded = DecodeColorFormat(format, number, swap);
     const auto attrib = read(cx, 0x31d + stride);
-    zero(cx, 0x31d + stride, ~0x3f000u, "other CB_COLOR_ATTRIB modes");
+    zero(cx, 0x31d + stride, ~0x3f000u, "color destination alpha override or other CB_COLOR_ATTRIB modes");
     color.samples = 1u << ((attrib >> 12u) & 7u);
     Require(color.samples <= 8u, "color targets with more than eight samples are unsupported");
     Require((1u << ((attrib >> 15u) & 3u)) == color.samples, "color targets with fewer fragments than samples (EQAA) are unsupported");
