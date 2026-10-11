@@ -959,7 +959,7 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
         if (cmask != 0) {
             color.cmaskAddress = cmask;
             color.cmaskBytes = CmaskBytes(color.extent.width, color.extent.height);
-            GuestMemory::CheckRange(reinterpret_cast<const void*>(color.cmaskAddress), color.cmaskBytes, CmaskLayout::Alignment, true);
+            if (color.samples == 1) GuestMemory::CheckRange(reinterpret_cast<const void*>(color.cmaskAddress), color.cmaskBytes, CmaskLayout::Alignment, true);
         }
         color.cmaskFastClear = (info & 0x2000u) != 0;
     }
