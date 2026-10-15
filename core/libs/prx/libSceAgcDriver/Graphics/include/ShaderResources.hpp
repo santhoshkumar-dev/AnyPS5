@@ -441,6 +441,7 @@ private:
         std::uint64_t generation = 0;
         // The collect of the check in progress, moved into `generation` once every element passed.
         std::uint64_t collected = 0;
+        std::array<std::uint64_t, 4> untracked{};
         // Storage-sourced textures: the image the view follows (kept alive by the texture).
         const StorageTexture* source = nullptr;
         bool depth = false;

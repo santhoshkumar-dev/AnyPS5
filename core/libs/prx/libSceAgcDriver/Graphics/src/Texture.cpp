@@ -2105,6 +2105,16 @@ bool StorageTexture::originalHolds(std::uint64_t address, std::size_t bytes) con
     return true;
 }
 
+bool StorageTexture::UntrackedUnchanged() const {
+    if (GuestMemory::CollectEpoch() == 0) return false;
+    if (!originalHolds(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) || original.size() != guestBytes) return false;
+    const auto* recorder = Recorder::Active();
+    const auto hint = GuestMemory::UntrackedHint(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    const std::array<std::uint64_t, 5> stamp{hint != 0, hint != 0 ? hint : GuestMemory::CollectEpoch(), GuestMemory::NewestStamp(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)), GuestMemory::ForgetSerial(), recorder != nullptr ? recorder->NewestWriteNote(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) : 0};
+    if ((stamp[3] & 1u) != 0) return false;
+    return comparedGuestBytes == stamp;
+}
+
 bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize) const {
     if (!originalHolds(address, bytes)) return false;
     struct Exempt {

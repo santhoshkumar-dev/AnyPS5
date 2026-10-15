@@ -3534,6 +3534,22 @@ void storageRefreshTests(const Device& device, Recorder& recorder, bool watched)
             Require(memoryHolds({0, 0, 255, 255}, 65536, 0x33), "guest memory lost the CPU store or the other units' results");
             image->Refresh();
             Require(holdsMixed({0, 0, 255, 255}, 65536 / 4, 0x33), "an unchanged surface changed at a refresh");
+            Require(!image->UntrackedUnchanged(), "a watched surface claimed the untracked comparison memo");
+        } else {
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+            image->Refresh();
+            Require(image->UntrackedUnchanged(), "an unchanged refresh over untracked memory left the fast proof no comparison memo");
+            if (AgcDriver::GuestMemory::UntrackedHint(address, surfaceBytes) != 0) {
+                texels[8] ^= 0xff;
+                AgcDriver::GuestMemory::BumpCollectEpoch();
+                Require(!image->UntrackedUnchanged(), "a change the comparison memo did not cover left it current");
+                texels[8] ^= 0xff;
+            } else {
+                AgcDriver::GuestMemory::BumpCollectEpoch();
+                Require(!image->UntrackedUnchanged(), "a collect epoch that passed left the comparison memo current");
+            }
+            image->Refresh();
+            Require(image->UntrackedUnchanged(), "an unchanged refresh after the change renewed the comparison memo");
         }
         draw({{0.0f, 1.0f, 0.0f, 1.0f}});
         std::memset(keys, 0x40, keyCount);
@@ -8047,6 +8063,12 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--storage-refresh-only") {
+            storageRefreshTests(device, recorder, false);
+            storageRefreshTests(device, recorder, true);
+            std::cout << "storage refresh tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--copied-direct-only") {
             copiedDirectOrderingTests(device, recorder);
             return 0;
